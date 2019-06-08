@@ -30,6 +30,10 @@
 #include <linux/task_io_accounting.h>
 #include <linux/rseq.h>
 
+#ifdef CONFIG_USE_CFS_CTREE
+#include <linux/ctree.h>
+#endif
+
 /* task_struct member predeclarations (sorted alphabetically): */
 struct audit_context;
 struct backing_dev_info;
@@ -440,7 +444,11 @@ struct sched_entity {
 	/* For load-balancing: */
 	struct load_weight		load;
 	unsigned long			runnable_weight;
+#ifdef CONFIG_USE_CFS_CTREE
+	struct ctree_node		run_node;
+#else
 	struct rb_node			run_node;
+#endif
 	struct list_head		group_node;
 	unsigned int			on_rq;
 

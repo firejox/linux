@@ -34,6 +34,12 @@ static inline void INIT_CTREE_ROOT(struct ctree_root *tree)
 #define ctree_last(root_ptr) \
 	list_last_entry(&((root_ptr)->link_head), struct ctree_node, link)
 
+#define ctree_last_or_null(root_ptr) ({\
+	struct list_head *head__ = &((root_ptr)->link_head); \
+	struct list_head *pos__ = READ_ONCE(head__->prev); \
+	pos__ != head__ ? list_entry(pos__, struct ctree_node, link) : NULL; \
+})
+
 static inline void ctree_node_clean(struct ctree_node *node)
 {
 	node->parent = node->left = node->right = NULL;

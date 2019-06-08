@@ -508,6 +508,167 @@ static inline int entity_before(struct sched_entity *a,
 	return (s64)(a->vruntime - b->vruntime) < 0;
 }
 
+#ifdef CONFIG_USE_CFS_CTREE
+static inline int ctree_entity_before(struct ctree_node *a,
+				struct ctree_node *b)
+{
+	return entity_before(ctree_entry(a, struct sched_entity, run_node),
+			ctree_entry(b, struct sched_entity, run_node));
+}
+
+static inline void ctree_merge(struct ctree_node *l, struct ctree_node *r,
+				struct ctree_node *pa,
+				struct ctree_node **link)
+{
+	while (true) {
+		if (!l) {
+			*link = r;
+			if (r)
+				r->parent = pa;
+
+			break;
+		} else if (!r) {
+			*link = l;
+			l->parent = pa;
+
+			break;
+		} else if (ctree_entity_before(r, l)) {
+			*link = r;
+			r->parent = pa;
+			link = &r->left;
+
+			pa = r;
+			r = r->left;
+		} else {
+			*link = l;
+			l->parent = pa;
+			link = &l->right;
+
+			pa = l;
+			l = l->right;
+		}
+	}
+}
+
+static void update_min_vruntime(struct cfs_rq *cfs_rq)
+{
+	struct sched_entity *curr = cfs_rq->curr;
+	struct ctree_node *root = cfs_rq->tasks_timeline.node;
+
+	u64 vruntime = cfs_rq->min_vruntime;
+
+	if (curr) {
+		if (curr->on_rq)
+			vruntime = curr->vruntime;
+		else
+			curr = NULL;
+	}
+
+	if (root) { /* non-empty tree */
+		struct sched_entity *se;
+		se = ctree_entry(root, struct sched_entity, run_node);
+
+		if (!curr)
+			vruntime = se->vruntime;
+		else
+			vruntime = min_vruntime(vruntime, se->vruntime);
+	}
+
+	/* ensure we never gain time by being placed backwards. */
+	cfs_rq->min_vruntime = max_vruntime(cfs_rq->min_vruntime, vruntime);
+#ifndef CONFIG_64BIT
+	smp_wmb();
+	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
+#endif
+}
+
+/*
+ * Enqueue an entity into the rb-tree:
+ */
+static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	struct ctree_root *tree = &cfs_rq->tasks_timeline;
+	struct ctree_node *root = tree->node;
+	struct ctree_node *new = &se->run_node;
+	struct ctree_node *tmp;
+
+	ctree_node_clean(new);
+
+	if (unlikely(ctree_empty(tree))) {
+		tree->node = new;
+
+		list_add(&new->link, &tree->link_head);
+	} else if(ctree_entity_before(new, root)) {
+		new->right = root;
+		root->parent = new;
+		tree->node = new;
+
+		list_add(&new->link, &tree->link_head);
+	} else {
+		struct ctree_node *pa = ctree_last(tree);
+
+		while (ctree_entity_before(new, pa))
+			pa = pa->parent;
+
+		tmp = pa->right;
+		new->left = tmp;
+
+		new->parent = pa;
+		pa->right = new;
+
+		if (tmp)
+			tmp->parent = new;
+
+		list_add_tail(&new->link, &tree->link_head);
+	}
+}
+
+static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	struct ctree_root *tree = &cfs_rq->tasks_timeline;
+	struct ctree_node *old = &se->run_node;
+	struct ctree_node *pa = old->parent;
+	struct ctree_node *root;
+	struct ctree_node **link;
+
+	if (likely(!pa))
+		link = &tree->node;
+	else if (pa->left == old)
+		link = &pa->left;
+	else
+		link = &pa->right;
+
+	ctree_merge(old->left, old->right, pa, link);
+	list_del(&old->link);
+
+	root = tree->node;
+	if (root && root->left) {
+		ctree_merge(root->left, root->right, root, &root->right);
+		root->left = NULL;
+		list_move(&root->link, &tree->link_head);
+	}
+}
+
+struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
+{
+	struct ctree_node *root = cfs_rq->tasks_timeline.node;
+
+	if (!root)
+		return NULL;
+
+	return ctree_entry(root, struct sched_entity, run_node);
+}
+
+static struct sched_entity *__pick_next_entity(struct sched_entity *se)
+{
+	struct ctree_node *next = se->run_node.right;
+
+	if (!next)
+		return NULL;
+
+	return ctree_entry(next, struct sched_entity, run_node);
+}
+#else
 static void update_min_vruntime(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = cfs_rq->curr;
@@ -597,16 +758,26 @@ static struct sched_entity *__pick_next_entity(struct sched_entity *se)
 
 	return rb_entry(next, struct sched_entity, run_node);
 }
+#endif
 
 #ifdef CONFIG_SCHED_DEBUG
 struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq)
 {
+#ifdef CONFIG_USE_CFS_CTREE
+	struct ctree_node *max_node = ctree_last_or_null(&cfs_rq->tasks_timeline);
+
+	if (!max_node)
+		return NULL;
+
+	return ctree_entry(max_node, struct sched_entity, run_node);
+#else
 	struct rb_node *last = rb_last(&cfs_rq->tasks_timeline.rb_root);
 
 	if (!last)
 		return NULL;
 
 	return rb_entry(last, struct sched_entity, run_node);
+#endif
 }
 
 /**************************************************************
@@ -10404,7 +10575,11 @@ static void set_curr_task_fair(struct rq *rq)
 
 void init_cfs_rq(struct cfs_rq *cfs_rq)
 {
+#ifdef CONFIG_USE_CFS_CTREE
+	INIT_CTREE_ROOT(&cfs_rq->tasks_timeline);
+#else
 	cfs_rq->tasks_timeline = RB_ROOT_CACHED;
+#endif
 	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
 #ifndef CONFIG_64BIT
 	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;

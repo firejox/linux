@@ -65,6 +65,13 @@ config THREAD_INFO_IN_TASK
 
 menu "General setup"
 
+config USE_CFS_CTREE
+        bool "Implement CFS by Cartesian Tree"
+        default y
+        help
+          Enable this option that CFS will be implemented by Cartesian tree
+          instead of Red-Black Tree.
+
 config BROKEN
 	bool
 
