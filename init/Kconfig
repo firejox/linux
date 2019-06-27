@@ -65,6 +65,13 @@ config THREAD_INFO_IN_TASK
 
 menu "General setup"
 
+config CFS_PAIRING_HEAP
+        bool "Implement Completely Fair Scheduler by Pairing Heap"
+        default y
+        help
+          Enable this option that Completely Fair Scheduler will be implemented
+          by Pairing Heap instead of Red-Black Tree
+
 config BROKEN
 	bool
 

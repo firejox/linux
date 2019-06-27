@@ -508,6 +508,210 @@ static inline int entity_before(struct sched_entity *a,
 	return (s64)(a->vruntime - b->vruntime) < 0;
 }
 
+#ifdef CONFIG_CFS_PAIRING_HEAP
+static inline int pairing_heap_comp(struct child_sibling_node *a,
+				struct child_sibling_node *b)
+{
+	return entity_before(container_of(a, struct sched_entity, run_node),
+			container_of(b, struct sched_entity, run_node));
+}
+
+static inline void pairing_heap_ch_to_sib(struct child_sibling_node *node)
+{
+	struct child_sibling_node *ch = node->child;
+
+	if (ch) {
+		struct list_head *c_tail = ch->sibling.prev;
+		struct list_head *n_tail = node->sibling.prev;
+
+		node->child = NULL;
+
+		n_tail->next = &ch->sibling;
+		ch->sibling.prev = n_tail;
+
+		c_tail->next = &node->sibling;
+		node->sibling.prev = c_tail;
+	}
+}
+
+static inline void pairing_heap_sib_merge(struct child_sibling_node *node,
+					struct child_sibling_node *pa,
+					struct child_sibling_node **link)
+{
+	struct list_head dummy;
+	struct list_head * const head = &dummy;
+	struct list_head *i, *j, *tmp;
+	struct child_sibling_node *a, *b;
+
+	if (CHILD_SIBLING_NODE_NO_SIB(node)) {
+		node->parent = pa;
+		*link = node;
+		return;
+	}
+
+	list_add_tail(head, &node->sibling);
+
+	/* first step merge */
+	for (i = head->next, j = i->next, tmp = j->next;
+			(i != head) && (j != head);
+			i = tmp, j = i->next, tmp = j->next) {
+		a = list_entry(i, struct child_sibling_node, sibling);
+		b = list_entry(j, struct child_sibling_node, sibling);
+
+		if (pairing_heap_comp(a, b)) {
+			list_del(j);
+			child_sibling_node_add_child(a, b);
+		} else {
+			list_del(i);
+			child_sibling_node_add_child(b, a);
+		}
+	}
+
+	/* second step merge */
+	a = list_entry(head->next, struct child_sibling_node, sibling);
+
+	for (i = head->next, j = i->next, tmp = j->next;
+			(i != head) && (j != head);
+			j = tmp, tmp = j->next) {
+		b = list_entry(j, struct child_sibling_node, sibling);
+
+		if (pairing_heap_comp(a, b)) {
+			list_del(j);
+			child_sibling_node_add_child(a, b);
+		} else {
+			list_del(i);
+			child_sibling_node_add_child(b, a);
+			i = j;
+			a = b;
+		}
+	}
+
+	list_del(head);
+	a->parent = pa;
+	*link = a;
+}
+
+static void update_min_vruntime(struct cfs_rq *cfs_rq)
+{
+	struct sched_entity *curr = cfs_rq->curr;
+	struct child_sibling_node *root = cfs_rq->tasks_timeline.node;
+
+	u64 vruntime = cfs_rq->min_vruntime;
+
+	if (curr) {
+		if (curr->on_rq)
+			vruntime = curr->vruntime;
+		else
+			curr = NULL;
+	}
+
+	if (root) { /* non-empty tree */
+		struct sched_entity *se;
+		se = container_of(root, struct sched_entity, run_node);
+
+		if (!curr)
+			vruntime = se->vruntime;
+		else
+			vruntime = min_vruntime(vruntime, se->vruntime);
+	}
+
+	/* ensure we never gain time by being placed backwards. */
+	cfs_rq->min_vruntime = max_vruntime(cfs_rq->min_vruntime, vruntime);
+#ifndef CONFIG_64BIT
+	smp_wmb();
+	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
+#endif
+}
+
+/*
+ * Enqueue an entity into the rb-tree:
+ */
+static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	struct child_sibling_root *heap = &cfs_rq->tasks_timeline;
+	struct child_sibling_node *root = READ_ONCE(heap->node);
+	struct child_sibling_node *se_node = &se->run_node;
+
+	*se_node = CHILD_SILBLING_NODE_INIT(se_node);
+
+	if (unlikely(!root)) {
+		heap->node = se_node;
+	} else if (pairing_heap_comp(se_node, root)) {
+		root->parent = se_node;
+		se_node->child = root;
+		heap->node = se_node;
+	} else {
+		struct child_sibling_node *ch = READ_ONCE(root->child);
+
+		if (unlikely(!ch)) {
+			se_node->parent = root;
+			root->child = se_node;
+		} else if (pairing_heap_comp(se_node, ch)) {
+			ch->parent = se_node;
+			se_node->child = ch;
+
+			se_node->parent = root;
+			root->child = se_node;
+		} else {
+			child_sibling_node_add_child(ch, se_node);
+		}
+	}
+}
+
+static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	struct child_sibling_root *heap = &cfs_rq->tasks_timeline;
+	struct child_sibling_node *old = &se->run_node;
+	struct child_sibling_node *pa = old->parent;
+	struct list_head *sib = &old->sibling;
+	struct child_sibling_node *t;
+	struct child_sibling_node **link;
+
+	if (likely(!pa))
+		link = &heap->node;
+	else
+		link = &pa->child;
+
+	pairing_heap_ch_to_sib(old);
+
+	if (CHILD_SIBLING_NODE_NO_SIB(old)) {
+		*link = NULL;
+	} else {
+		t = list_entry(sib->next, struct child_sibling_node, sibling);
+		list_del(sib);
+		pairing_heap_sib_merge(t, pa, link);
+	}
+
+	t = heap->node;
+
+	if (t) {
+		struct child_sibling_node *child = t->child;
+
+		if (child)
+			pairing_heap_sib_merge(child, t, &t->child);
+	}
+}
+
+struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
+{
+	struct child_sibling_node *root = cfs_rq->tasks_timeline.node;
+
+	if (!root)
+		return NULL;
+
+	return container_of(root, struct sched_entity, run_node);
+}
+
+static struct sched_entity *__pick_next_entity(struct sched_entity *se)
+{
+	struct child_sibling_node *next = se->run_node.child;
+
+	if (!next)
+		return NULL;
+
+	return container_of(next, struct sched_entity, run_node);
+}
+#else
 static void update_min_vruntime(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = cfs_rq->curr;
@@ -597,16 +801,21 @@ static struct sched_entity *__pick_next_entity(struct sched_entity *se)
 
 	return rb_entry(next, struct sched_entity, run_node);
 }
+#endif
 
 #ifdef CONFIG_SCHED_DEBUG
 struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq)
 {
+#ifdef CONFIG_CFS_PAIRING_HEAP
+	return NULL;
+#else
 	struct rb_node *last = rb_last(&cfs_rq->tasks_timeline.rb_root);
 
 	if (!last)
 		return NULL;
 
 	return rb_entry(last, struct sched_entity, run_node);
+#endif
 }
 
 /**************************************************************
@@ -10404,7 +10613,11 @@ static void set_curr_task_fair(struct rq *rq)
 
 void init_cfs_rq(struct cfs_rq *cfs_rq)
 {
+#ifdef CONFIG_CFS_PAIRING_HEAP
+	cfs_rq->tasks_timeline = CHILD_SIBLING_ROOT;
+#else
 	cfs_rq->tasks_timeline = RB_ROOT_CACHED;
+#endif
 	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
 #ifndef CONFIG_64BIT
 	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;

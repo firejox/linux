@@ -516,8 +516,13 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 			SPLIT_NS(cfs_rq->exec_clock));
 
 	raw_spin_lock_irqsave(&rq->lock, flags);
+#ifdef CONFIG_CFS_PAIRING_HEAP
+	if (!CHILD_SIBLING_EMPTY_ROOT(&cfs_rq->tasks_timeline))
+		MIN_vruntime = (__pick_first_entity(cfs_rq))->vruntime;
+#else
 	if (rb_first_cached(&cfs_rq->tasks_timeline))
 		MIN_vruntime = (__pick_first_entity(cfs_rq))->vruntime;
+#endif
 	last = __pick_last_entity(cfs_rq);
 	if (last)
 		max_vruntime = last->vruntime;

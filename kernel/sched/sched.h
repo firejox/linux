@@ -497,7 +497,11 @@ struct cfs_rq {
 	u64			min_vruntime_copy;
 #endif
 
+#ifdef CONFIG_CFS_PAIRING_HEAP
+	struct child_sibling_root tasks_timeline;
+#else
 	struct rb_root_cached	tasks_timeline;
+#endif
 
 	/*
 	 * 'curr' points to currently running entity on this cfs_rq.
